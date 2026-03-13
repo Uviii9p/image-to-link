@@ -1,92 +1,130 @@
-const Database = require('better-sqlite3');
+const fs = require('fs-extra');
 const path = require('path');
 const os = require('os');
 
-// Use /tmp for Vercel's read-only environment to prevent deployment crashes
+// Use /tmp for Vercel's read-only environment
 const dbPath = process.env.VERCEL 
-  ? path.join(os.tmpdir(), 'analytics.sqlite') 
-  : path.join(__dirname, 'analytics.sqlite');
+  ? path.join(os.tmpdir(), 'analytics.json') 
+  : path.join(__dirname, 'analytics.json');
 
-const db = new Database(dbPath);
-
-db.exec(`
-  CREATE TABLE IF NOT EXISTS images (
-    id TEXT PRIMARY KEY,
-    filename TEXT NOT NULL,
-    original_name TEXT NOT NULL,
-    github_path TEXT NOT NULL,
-    size INTEGER,
-    mime_type TEXT,
-    width INTEGER,
-    height INTEGER,
-    github_url TEXT,
-    cdn_url TEXT,
-    preview_url TEXT,
-    short_link TEXT UNIQUE,
-    collection TEXT DEFAULT 'Uncategorized',
-    views INTEGER DEFAULT 0,
-    bandwidth_used INTEGER DEFAULT 0,
-    palette TEXT,
-    tags TEXT,
-    caption TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS analytics_stats (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    total_images INTEGER DEFAULT 0,
-    total_views INTEGER DEFAULT 0,
-    total_bandwidth INTEGER DEFAULT 0,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-  );
-
-  CREATE TABLE IF NOT EXISTS daily_stats (
-    date TEXT PRIMARY KEY,
-    uploads INTEGER DEFAULT 0,
-    views INTEGER DEFAULT 0
-  );
-  
-  INSERT INTO analytics_stats (id, total_images) SELECT 1, 0 WHERE NOT EXISTS (SELECT 1 FROM analytics_stats WHERE id = 1);
-`);
-
-const statements = {
-  insertImage: db.prepare(`
-    INSERT INTO images (id, filename, original_name, github_path, size, mime_type, width, height, github_url, cdn_url, preview_url, short_link, collection, palette, tags, caption)
-    VALUES (@id, @filename, @original_name, @github_path, @size, @mime_type, @width, @height, @github_url, @cdn_url, @preview_url, @short_link, @collection, @palette, @tags, @caption)
-  `),
-  getAllImages: db.prepare(`SELECT * FROM images ORDER BY created_at DESC`),
-  getImage: db.prepare(`SELECT * FROM images WHERE id = ?`),
-  getImageByShortLink: db.prepare(`SELECT * FROM images WHERE short_link = ?`),
-  getImageByFilename: db.prepare(`SELECT * FROM images WHERE filename = ?`),
-  updateCollection: db.prepare(`UPDATE images SET collection = ? WHERE id = ?`),
-  deleteImage: db.prepare(`DELETE FROM images WHERE id = ?`),
-  renameImage: db.prepare(`UPDATE images SET filename = ? WHERE id = ?`),
-  incrementView: db.prepare(`
-    UPDATE images SET views = views + 1, bandwidth_used = bandwidth_used + size WHERE short_link = ?
-  `),
-  updateGlobalAnalytics: db.prepare(`
-    UPDATE analytics_stats SET 
-      total_images = (SELECT COUNT(*) FROM images),
-      total_views = (SELECT SUM(views) FROM images),
-      total_bandwidth = (SELECT SUM(bandwidth_used) FROM images)
-    WHERE id = 1
-  `),
-  getAnalytics: db.prepare(`SELECT * FROM analytics_stats WHERE id = 1`),
-  recordUpload: db.prepare(`
-    INSERT INTO daily_stats (date, uploads) 
-    VALUES (date('now'), 1) 
-    ON CONFLICT(date) DO UPDATE SET uploads = uploads + 1
-  `),
-  recordView: db.prepare(`
-    INSERT INTO daily_stats (date, views) 
-    VALUES (date('now'), 1) 
-    ON CONFLICT(date) DO UPDATE SET views = views + 1
-  `),
-  getDailyStats: db.prepare(`
-    SELECT * FROM daily_stats 
-    WHERE date >= date('now', '-6 days') 
-    ORDER BY date ASC
-  `)
+let data = {
+  images: [],
+  analytics_stats: { id: 1, total_images: 0, total_views: 0, total_bandwidth: 0, updated_at: new Date().toISOString() },
+  daily_stats: {}
 };
 
-module.exports = { db, ...statements };
+const loadDB = () => {
+  try {
+    if (fs.existsSync(dbPath)) {
+      data = fs.readJsonSync(dbPath);
+    } else {
+      saveDB();
+    }
+  } catch (err) {
+    console.error('Failed to load DB:', err);
+  }
+};
+
+const saveDB = () => {
+  try {
+    // Vercel /tmp allows writing. If this fails, it logs safely.
+    fs.writeJsonSync(dbPath, data, { spaces: 2 });
+  } catch (err) {
+    console.error('Failed to save DB:', err);
+  }
+};
+
+loadDB();
+
+const statements = {
+  insertImage: {
+    run: (img) => {
+      img.created_at = img.created_at || new Date().toISOString();
+      img.views = img.views || 0;
+      img.bandwidth_used = img.bandwidth_used || 0;
+      data.images.push(img);
+      saveDB();
+    }
+  },
+  getAllImages: {
+    all: () => [...data.images].sort((a,b) => new Date(b.created_at) - new Date(a.created_at))
+  },
+  getImage: {
+    get: (id) => data.images.find(i => i.id === id) || null
+  },
+  getImageByShortLink: {
+    get: (short) => data.images.find(i => i.short_link === short) || null
+  },
+  getImageByFilename: {
+    get: (name) => data.images.find(i => i.filename === name) || null
+  },
+  updateCollection: {
+    run: (col, id) => {
+      const img = data.images.find(i => i.id === id);
+      if (img) { img.collection = col; saveDB(); }
+    }
+  },
+  deleteImage: {
+    run: (id) => {
+      data.images = data.images.filter(i => i.id !== id);
+      saveDB();
+    }
+  },
+  renameImage: {
+    run: (name, id) => {
+      const img = data.images.find(i => i.id === id);
+      if (img) { img.filename = name; saveDB(); }
+    }
+  },
+  incrementView: {
+    run: (short) => {
+      const img = data.images.find(i => i.short_link === short);
+      if (img) {
+        img.views = (img.views || 0) + 1;
+        img.bandwidth_used = (img.bandwidth_used || 0) + (img.size || 0);
+        saveDB();
+      }
+    }
+  },
+  updateGlobalAnalytics: {
+    run: () => {
+      data.analytics_stats.total_images = data.images.length;
+      data.analytics_stats.total_views = data.images.reduce((sum, img) => sum + (img.views || 0), 0);
+      data.analytics_stats.total_bandwidth = data.images.reduce((sum, img) => sum + (img.bandwidth_used || 0), 0);
+      data.analytics_stats.updated_at = new Date().toISOString();
+      saveDB();
+    }
+  },
+  getAnalytics: {
+    get: () => data.analytics_stats
+  },
+  recordUpload: {
+    run: () => {
+      const today = new Date().toISOString().split('T')[0];
+      if (!data.daily_stats[today]) data.daily_stats[today] = { date: today, uploads: 0, views: 0 };
+      data.daily_stats[today].uploads++;
+      saveDB();
+    }
+  },
+  recordView: {
+    run: () => {
+      const today = new Date().toISOString().split('T')[0];
+      if (!data.daily_stats[today]) data.daily_stats[today] = { date: today, uploads: 0, views: 0 };
+      data.daily_stats[today].views++;
+      saveDB();
+    }
+  },
+  getDailyStats: {
+    all: () => {
+      const sixDaysAgo = new Date();
+      sixDaysAgo.setDate(sixDaysAgo.getDate() - 6);
+      const limitDate = sixDaysAgo.toISOString().split('T')[0];
+      
+      return Object.values(data.daily_stats)
+        .filter(d => d.date >= limitDate)
+        .sort((a,b) => a.date.localeCompare(b.date));
+    }
+  }
+};
+
+module.exports = { ...statements };
